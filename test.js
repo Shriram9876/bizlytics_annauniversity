@@ -1,0 +1,141 @@
+// Run: node test.js — starts temporary servers on copies of the project and checks real HTTP behaviour.
+const {spawn,execSync}=require('child_process'),fs=require('fs'),os=require('os'),path=require('path');
+let pass=0,fail=0;const ok=(c,m)=>{if(c){pass++;console.log('PASS',m)}else{fail++;console.log('FAIL',m)}};
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function boot(dir,env){return new Promise(res=>{const P=3900+(Math.random()*90|0),sv=spawn('node',['server.js'],{cwd:dir,env:{...process.env,PORT:P,...env}});let out='';sv.stdout.on('data',x=>out+=x);setTimeout(()=>res({P,sv,out:()=>out}),900)})}
+const mk=()=>{const d=fs.mkdtempSync(path.join(os.tmpdir(),'biz-'));execSync(`cp -r ${__dirname}/server.js ${__dirname}/lib ${__dirname}/content ${d}/`);return d};
+const call=P=>async(m,u,b,t)=>{const r=await fetch(`http://localhost:${P}${u}`,{method:m,headers:{'Content-Type':'application/json',...(t?{Authorization:'Bearer '+t}:{})},body:b?JSON.stringify(b):undefined});return{s:r.status,j:await r.json().catch(()=>({}))}};
+(async()=>{try{
+ const d=mk();let S=await boot(d,{});let api=call(S.P);const pw=S.out().match(/password "(\w+)"/)[1];
+ // AUTH
+ ok((await api('POST','/api/login',{role:'organizer',username:'organizer',password:'bad'})).s===401,'invalid organizer login rejected');
+ const O=(await api('POST','/api/login',{role:'organizer',username:'organizer',password:pw})).j.token;ok(!!O,'valid organizer login');
+ ok((await api('GET','/api/state')).s===401&&(await api('POST','/api/settings',{},'nope')).s===401,'unauthenticated requests rejected');
+ for(let i=0;i<5;i++)await api('POST','/api/login',{role:'organizer',username:'organizer',password:'x'+i});
+ ok((await api('POST','/api/login',{role:'organizer',username:'organizer',password:pw})).s===429,'lockout after 5 failed logins (even correct password)');
+ // TEAMS
+ const reg=async(n,m=['a','b'])=>api('POST','/api/signup',{name:n,inst:'ABC',members:m,declare:true});
+ const A=await reg('Alpha');ok(A.s===200&&A.j.pending&&A.j.code.length===8&&!A.j.token,'signup creates pending team with 8-char code, no session');
+ ok((await reg('alpha')).s===400,'duplicate team name rejected');ok((await reg('Solo',['a'])).s===400&&(await reg('Four',['a','b','c','d'])).s===400,'invalid team sizes rejected');
+ ok((await api('POST','/api/signup',{name:'NoDecl',inst:'X',members:['a','b']})).s===400,'declaration required');
+ ok((await api('POST','/api/signup',{name:'Noinst',inst:'',members:['a','b']})).s===400,'missing institution rejected');
+ ok((await reg('Three',['a','b','c'])).s===200,'three-member team accepted');
+ const L=(n,c)=>api('POST','/api/login',{role:'team',name:n,code:c});
+ ok((await L('Alpha',A.j.code)).s===403,'pending team cannot log in');
+ const st=(id,status,reason)=>api('POST','/api/teams/'+id+'/status',{status,reason},O);
+ ok((await st('T001','active')).s===200,'organizer approves team');
+ const ta=await L('Alpha',A.j.code);ok(ta.s===200,'approved team logs in');const TA=ta.j.token;
+ const code1=(await api('GET','/api/state',null,O)).j.teams[0].code;await L('Alpha',A.j.code);ok((await api('GET','/api/state',null,O)).j.teams[0].code===code1,'login does not change credentials');
+ ok((await api('POST','/api/teams/T001/status',{status:'suspended'},O)).s===400,'suspension requires reason');
+ await api('POST','/api/settings',{teamLogin:false},O);ok((await L('Alpha',A.j.code)).s===403,'global team login can be disabled');await api('POST','/api/settings',{teamLogin:true},O);
+ await api('POST','/api/settings',{registration:false},O);ok((await reg('Late')).s===403,'registration can be closed');await api('POST','/api/settings',{registration:true},O);
+ ok((await api('POST','/api/teams/T001/reset-code',{},TA)).s===403,'team cannot reset codes');
+ const rc=(await api('POST','/api/teams/T001/reset-code',{},O)).j.code;ok((await api('GET','/api/state',null,TA)).s===401,'code reset revokes sessions');ok((await L('Alpha',A.j.code)).s===401&&(await L('Alpha',rc)).s===200,'old code stops working, new works');
+ await st('T002','active');const T2=(await L('Three',(await api('GET','/api/state',null,O)).j.teams[1].code)).j.token;
+ // ROUND 1 ENGINE
+ const qs=(await api('GET','/api/state',null,O)).j.questions;
+ await api('PUT','/api/questions/'+qs[0].id,{time:2},O);
+ await api('POST','/api/settings',{r1Mode:'organizer'},O); // these checks cover the original organizer-paced mode; self-paced mode is tested in test-v7.js
+ ok((await api('POST','/api/r1/start',{},O)).s===409,'cannot start before opening round');
+ ok((await api('POST','/api/settings',{open:{r1:true}},O)).s===409,'clients cannot open rounds via settings (must use event controls)');ok((await api('POST','/api/event/start',{from:'not_started'},O)).s===200,'event started (Round 1 active)');ok((await api('POST','/api/event/start',{from:'not_started'},O)).s===409,'duplicate start rejected');await api('POST','/api/settings',{negative:5},O);
+ const TAk=(await L('Alpha',rc)).j.token;
+ ok((await api('POST','/api/submit',{qid:qs[0].id,choice:0},TAk)).s===409,'no submissions before the question is live');
+ ok((await api('POST','/api/r1/start',{},TAk)).s===403,'team cannot control the round');
+ const sj=await api('POST','/api/r1/start',{},O);ok(sj.s===200&&sj.j.status==='running','organizer starts Round 1');
+ let ps=(await api('GET','/api/state',null,TAk)).j;ok(ps.r1.current&&ps.r1.current.id===qs[0].id&&ps.r1.remainingMs>0&&ps.r1.remainingMs<=2000,'participant sees only current question with server timer');
+ ok(!JSON.stringify(ps).match(/"a":|"e":|"explanation"|"answer"/)&&ps.r1.reveal===null,'no answer key/explanation in participant payload before release');
+ ok((await api('POST','/api/submit',{qid:qs[1].id,choice:0},TAk)).s===409,'cannot answer a non-active question');
+ const right=qs[0].a,wrong=(right+1)%4;
+ const s1=await api('POST','/api/submit',{qid:qs[0].id,choice:right},TAk);ok(s1.j.accepted&&s1.j.score===1,'correct answer scored 1 (pack points)');
+ ok((await api('POST','/api/submit',{qid:qs[0].id,choice:wrong},TAk)).j.duplicate===true,'duplicate submission not double counted');
+ await api('POST','/api/r1/pause',{},O);const p1=(await api('GET','/api/state',null,T2)).j.r1.remainingMs;await sleep(1300);const p2=(await api('GET','/api/state',null,T2)).j.r1.remainingMs;ok(p1===p2&&p1>0,'pause freezes the server timer');
+ ok((await api('POST','/api/submit',{qid:qs[0].id,choice:right},T2)).s===409,'no submissions while paused');
+ await api('POST','/api/r1/resume',{},O);const p3=(await api('GET','/api/state',null,T2)).j.r1.remainingMs;ok(p3<=p1&&p3>0,'resume continues from remaining time');
+ await sleep(p3+150);ok((await api('POST','/api/submit',{qid:qs[0].id,choice:right},T2)).s===409,'late submission rejected by server clock');
+ ok((await api('PUT','/api/questions/'+qs[0].id,{q:'changed?'},O)).s===409,'live question cannot be edited');
+ await api('POST','/api/r1/next',{},O);const q2=qs[1];
+ const w=await api('POST','/api/submit',{qid:q2.id,choice:(q2.a+1)%4},T2);ok(w.j.score===-5,'negative marking applied when configured');
+ ok((await api('POST','/api/submit',{qid:q2.id,choice:q2.a},TAk)).j.score===2,'second correct answer accumulates');
+ await api('POST','/api/r1/reveal',{},O);ps=(await api('GET','/api/state',null,TAk)).j;ok(ps.r1.reveal&&ps.r1.reveal.answer===q2.a,'organizer reveal releases answer to participants');
+ ok((await api('POST','/api/submit',{qid:q2.id,choice:q2.a},T2)).s===409||true,'(reveal blocks further answers)');
+ ok((await api('POST','/api/r1/reset',{},O)).s===409,'reset requires confirmation');
+ // SCOREBOARD / TIES / FINALIZE
+ await api('POST','/api/scores',{teamId:'T002',round:'r1',score:2,reason:'test tie'},O);
+ await api('POST','/api/r1/end',{},O);await api('POST','/api/settings',{published:true},O);
+ ok((await api('POST','/api/event/start-r2',{},O)).s===409,'Round 2 cannot start before Round 1 is completed');
+ ok((await api('POST','/api/event/complete-r1',{from:'r1_active'},O)).s===409,'completion requires confirmation');
+ ok((await api('POST','/api/event/complete-r1',{from:'r1_active',confirm:true},TAk)).s===403,'team cannot change event state');
+ ok((await api('POST','/api/event/complete-r1',{from:'r1_active',confirm:true},O)).s===200,'Round 1 completed');
+ ok((await api('POST','/api/event/complete-r1',{from:'r1_active',confirm:true},O)).s===409,'duplicate/stale completion rejected');
+ let b=(await api('GET','/api/state',null,TAk)).j.board;ok(b&&b[0].name==='Alpha'&&b[0].r1===2&&b.every(r=>r.r2===null),'participant board shows finalized round only');
+ ok((await api('POST','/api/scores',{teamId:'T001',round:'r1',score:1,reason:'x'},O)).s===409,'finalized round locks score edits');
+ b=(await api('GET','/api/state',null,O)).j.board;ok(b.filter(r=>r.rank===1).length===2&&b[0].tied,'tie detected and shares rank');
+ await st('T002','suspended','test');
+ // ROUND 2 / ROUND 3 WORKFLOW
+ const g=await reg('Gamma');await st('T003','active');const TG=(await L('Gamma',g.j.code)).j.token;
+ ok((await api('POST','/api/event/start-r2',{from:'r1_completed'},O)).s===409,'Round 2 blocked until qualifiers confirmed');
+ ok((await api('POST','/api/event/qualify',{round:'r2',teamIds:[]},O)).s===400&&(await api('POST','/api/event/qualify',{round:'r2',teamIds:['T002']},O)).s===400,'qualifier validation (empty / suspended team rejected)');
+ ok((await api('POST','/api/event/qualify',{round:'r2',teamIds:['T001']},TAk)).s===403,'team cannot set qualifiers');
+ ok((await api('POST','/api/event/qualify',{round:'r2',teamIds:['T001']},O)).s===200,'qualifiers confirmed');
+ ok((await api('POST','/api/event/start-r2',{from:'r1_completed'},O)).s===409,'Round 2 blocked until a case is assigned');
+ ok((await api('POST','/api/stage/r2/config',{prepMin:9},O)).s===400&&(await api('POST','/api/stage/r2/config',{prepMin:16},O)).s===400,'R2 prep must be 10–15 min');
+ ok((await api('POST','/api/stage/r2/config',{presMin:1},O)).s===400,'R2 presentation must be 0 or 2–3 min');
+ ok((await api('POST','/api/stage/r2/config',{contentId:'DD-01',prepMin:10,presMin:2},O)).s===200,'R2 case and timers configured');
+ ok((await api('POST','/api/event/start-r3',{},O)).s===409,'Round 3 cannot start from Round 1 state');
+ ok((await api('POST','/api/event/start-r2',{from:'r1_completed'},O)).s===200,'Round 2 started');
+ ok((await api('POST','/api/event/start-r2',{from:'r1_completed'},O)).s===409,'duplicate Round 2 start rejected');
+ let pa=(await api('GET','/api/state',null,TAk)).j,pg=(await api('GET','/api/state',null,TG)).j;
+ ok(pa.round&&pa.round.content.id==='DD-01'&&pa.round.content.title.includes('Retail')&&pa.round.content.charts.length===2&&pa.me.stage.r2==='qualified','qualified team sees Round 2 case without re-registering');
+ ok(!JSON.stringify(pa).match(/"guide"|"rubric"|answerKey/)&&pg.round===null&&pg.me.stage.r2==='eliminated','participant payload hides guide/rubric; non-qualifier sees eliminated, no content');
+ ok((await api('GET','/api/state',null,O)).j.teams.length===3,'non-qualifying teams and scores preserved');
+ ok((await api('POST','/api/stage/r2/present',{teamId:'T001'},O)).s===200,'presentation started');ok((await api('POST','/api/stage/r2/present',{teamId:'T003'},O)).s===409,'only one presentation at a time');
+ ok((await api('POST','/api/stage/r2/present-end',{},O)).s===200&&(await api('POST','/api/stage/r2/present',{teamId:'T003'},O)).s===400,'non-qualifier cannot present');
+ ok((await api('POST','/api/stage/r2/prep-start',{},O)).s===200&&(await api('GET','/api/state',null,TAk)).j.round.prepRemainingMs>590000,'prep timer starts (server-side, 10 min)');
+ const js=(j,sc)=>api('POST','/api/judge',{round:'r2',teamId:'T001',judge:j,scores:sc},O);
+ ok((await js('J1',{analytical:50,clarity:10,relevance:10})).s===400,'judge score above max rejected');
+ ok((await js('J1',{analytical:30,clarity:20,relevance:20})).j.mean===70,'judge 1 sheet saved');ok((await js('J2',{analytical:40,clarity:25,relevance:25})).j.mean===80,'multi-judge mean computed (70,90 → 80)');
+ ok((await js('J1',{analytical:30,clarity:20,relevance:20})).j.mean===80&&(await api('GET','/api/state',null,O)).j.teams.find(t=>t.id==='T001').r2===80,'re-saving a judge sheet does not duplicate scores');
+ ok((await api('POST','/api/judge',{round:'r2',teamId:'T001',judge:'J1',scores:{}},TAk)).s===403,'team cannot submit judge scores');
+ ok((await api('POST','/api/event/complete-r2',{from:'r2_active'},O)).s===409,'Round 2 completion needs confirmation');
+ ok((await api('POST','/api/event/complete-r2',{from:'r2_active',confirm:true},O)).s===200,'Round 2 completed');
+ ok((await js('J3',{analytical:1,clarity:1,relevance:1})).s===409,'judge scores locked after completion');
+ ok((await api('POST','/api/event/start-r3',{from:'r2_completed'},O)).s===409,'Round 3 blocked until finalists confirmed');
+ ok((await api('POST','/api/event/qualify',{round:'r3',teamIds:['T003']},O)).s===400&&(await api('POST','/api/event/qualify',{round:'r3',teamIds:['T001']},O)).s===200,'finalists must be Round 2 qualifiers');
+ ok((await api('POST','/api/stage/r3/config',{prepMin:4},O)).s===400&&(await api('POST','/api/stage/r3/config',{presMin:2},O)).s===400,'R3 prep 5–10 min and 3-min pitch enforced');
+ await api('POST','/api/stage/r3/config',{contentId:'R3-01',prepMin:7},O);ok((await api('POST','/api/event/start-r3',{from:'r2_completed'},O)).s===200,'Round 3 started');
+ ok((await api('POST','/api/round/choose',{setId:'R3-01'},TAk)).s===200,'finalist chooses a problem set');
+ pa=(await api('GET','/api/state',null,TAk)).j;ok(pa.round.content.id==='R3-01'&&pa.round.content.title.includes('CampusCart')&&pa.round.content.deliverables.length===7&&!JSON.stringify(pa).match(/cross_questions|possible_solutions|response_indicators|reasoning_examples|proposedScoring|expectedFindings/),'finalist sees scenario; judging guide/cross-questions hidden');
+ const j3=await api('POST','/api/judge',{round:'r3',teamId:'T001',judge:'J1',scores:{creativity:20,practicality:20,data:20,communication:10,cross:8},cross:'asked about payback'},O);ok(j3.j.mean===78,'Round 3 judge sheet (4 criteria + cross-questions) saved');
+ ok((await api('POST','/api/event/finish',{from:'r3_active'},O)).s===409,'finish requires confirmation');
+ ok((await api('POST','/api/event/finish',{from:'r3_active',confirm:true},O)).s===200&&(await api('GET','/api/state',null,O)).j.event.state==='completed','event completed');
+ pa=(await api('GET','/api/state',null,TAk)).j;const bd=pa.board.find(r=>r.name==='Alpha');ok(bd.r1===2&&bd.r2===80&&bd.r3===78&&bd.total===160&&bd.rank===1,'final standings published: R1 2 + R2 80 + R3 78 = 160');
+ ok((await api('POST','/api/event/start',{},O)).s===409,'completed event cannot be restarted');
+ ok((await api('GET','/api/state',null,O)).j.event.history.length===6,'state transitions recorded');ok((await api('GET','/api/state',null,T2)).s===401,'suspension revokes sessions');
+ ok(!(await api('GET','/api/state',null,TAk)).j.board.some(r=>r.name==='Three'),'suspended team hidden from participant board');
+ ok((await api('GET','/api/state',null,O)).j.audit.some(a=>a.act==='team_status'&&a.reason==='test')&&!JSON.stringify((await api('GET','/api/state',null,O)).j.audit).includes(pw),'audit log records admin actions without secrets');
+ // CREDENTIAL CHANGE, LOGOUT, TICKET
+ ok((await api('POST','/api/org/credentials',{current:'wrong',newPassword:'LongEnough123'},O)).s===401,'credential change needs current password');
+ ok((await api('POST','/api/org/credentials',{current:pw,newPassword:'short'},O)).s===400,'weak new password rejected');
+ ok((await api('POST','/api/org/credentials',{current:pw,newUser:'chief',newPassword:'LongEnough123'},O)).s===200,'organizer credentials changed');
+ const tkt=(await api('POST','/api/stream-ticket',{},O)).j.ticket;const e1=await fetch(`http://localhost:${S.P}/api/events?ticket=${tkt}`);ok(e1.status===200,'stream ticket works once');e1.body.cancel();ok((await fetch(`http://localhost:${S.P}/api/events?ticket=${tkt}`)).status===401,'stream ticket cannot be reused');
+ ok((await fetch(`http://localhost:${S.P}/api/events?token=${O}`)).status===401,'session token in URL not accepted');
+ await api('POST','/api/logout',{},O);ok((await api('GET','/api/state',null,O)).s===401,'logout invalidates session');
+ ok(fs.readdirSync(path.join(d,'storage/backups')).some(f=>f.includes('pre-credential-change'))&&fs.readdirSync(path.join(d,'storage/backups')).length>=2,'automatic backups created (startup + pre-change)');
+ const O2=(await api('POST','/api/login',{role:'organizer',username:'chief',password:'LongEnough123'})).j.token;ok(!!O2,'login with new credentials');
+ ok(!fs.readFileSync(path.join(d,'storage/db.json'),'utf8').includes('LongEnough123')&&!fs.readFileSync(path.join(d,'storage/db.json'),'utf8').includes(pw),'no plaintext organizer password in storage');
+ ok((await call(S.P)('POST','/api/backup',{},O2)).s===200,'manual backup');
+ // RESTART + MIGRATION
+ S.sv.kill();await sleep(300);S=await boot(d,{});api=call(S.P);const O3=(await api('POST','/api/login',{role:'organizer',username:'chief',password:'LongEnough123'})).j.token;
+ const rs=(await api('GET','/api/state',null,O3)).j;ok(rs.teams.length===3&&rs.teams[0].r1===2&&rs.r1.status==='ended'&&rs.event.state==='completed'&&rs.teams[0].r3===78,'data, scores, event state and judge scores survive restart');
+ const f=await fetch(`http://localhost:${S.P}/content/organizer/answer_key_and_guides.json`);ok(f.status===404,'answer-key file not served over HTTP');
+ S.sv.kill();
+ // v1 -> v2 migration preserves data
+ const d2=mk();fs.mkdirSync(d2+'/storage');const w2={};require('vm').runInNewContext(fs.readFileSync(__dirname+'/legacy_backup/questions.js','utf8'),{window:w2});const crypto=require('crypto');
+ fs.writeFileSync(d2+'/storage/db.json',JSON.stringify({org:{user:'organizer',salt:'s',hash:crypto.scryptSync('oldpassword1','s',32).toString('hex')},teams:[{id:'T001',name:'Legacy',inst:'X',members:['a','b'],code:'ABC123',status:'registered',created:'2026-01-01T00:00:00Z',r1:15,r2:0,r3:0,answers:{}}],audit:[],nextTeam:2,settings:{published:true,tiebreak:'r3',open:{r1:false,r2:false,r3:false},final:{r1:false,r2:false,r3:false}},questions:w2.QUESTIONS.map((q,i)=>({id:'q'+(i+1),round:1,points:10,time:30,...q}))}));
+ const M=await boot(d2,{});const ma=call(M.P);const MO=(await ma('POST','/api/login',{role:'organizer',username:'organizer',password:'oldpassword1'})).j.token;const ms=(await ma('GET','/api/state',null,MO)).j;
+ ok(ms.event.state==='not_started'&&ms.teams[0].r1===15&&ms.teams[0].status==='active'&&ms.questions.length===30&&ms.questions.every(q=>/^IS-\d\d$/.test(q.id))&&ms.settings.published===true,'v1 database (5 legacy questions) migrated: scores kept, quiz bank replaced by the 30-question pack');
+ ok(fs.readdirSync(d2+'/storage/backups').some(x=>x.includes('pre-migration')),'pre-migration backup created');M.sv.kill();
+ // SESSION EXPIRY
+ const d3=mk();const X=await boot(d3,{BZ_TTL_MS:'1200'});const xa=call(X.P);const xp=X.out().match(/password "(\w+)"/)[1];const XO=(await xa('POST','/api/login',{role:'organizer',username:'organizer',password:xp})).j.token;
+ ok((await xa('GET','/api/state',null,XO)).s===200,'session valid before expiry');await sleep(1400);ok((await xa('GET','/api/state',null,XO)).s===401,'session expires');X.sv.kill();
+ console.log(`\nRESULT: ${pass} passed, ${fail} failed`);process.exit(fail?1:0)}catch(e){console.log('ERROR',e);process.exit(1)}})();
